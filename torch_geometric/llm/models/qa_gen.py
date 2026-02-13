@@ -15,6 +15,7 @@ from typing import Any, Dict, List, Optional, Tuple, TypedDict
 import faiss
 import numpy as np
 import pandas as pd
+import torch
 from jinja2 import Template
 from openai import OpenAI
 from sklearn.metrics.pairwise import cosine_similarity
@@ -172,6 +173,7 @@ class LLMClient:
         tensor_parallel_size: int = 1,
         gpu_memory_utilization: float = 0.9,
         max_model_len: Optional[int] = None,
+        max_num_batched_tokens: Optional[int] = None,
         enable_sleep_mode: bool = True,
     ):
         """Initialize LLMClient with generation, evaluation, and \
@@ -188,9 +190,14 @@ class LLMClient:
             tensor_parallel_size: Number of GPUs for tensor parallelism (VLLM)
             gpu_memory_utilization: GPU memory utilization 0-1 (VLLM)
             max_model_len: Maximum context length (VLLM)
+            max_num_batched_tokens: Maximum batched tokens (VLLM)
             enable_sleep_mode: Whether to enable sleep mode for VLLM models
         """
-        self.backend = backend
+        # Convert string backend to Backend enum
+        if isinstance(backend, str):
+            self.backend = Backend(backend.lower())
+        else:
+            self.backend = backend
         self.generation_model_name = generation_model
         self.evaluation_model_name = evaluation_model or generation_model
         self.embedding_model_name = embedding_model or generation_model
@@ -198,7 +205,9 @@ class LLMClient:
         self.tensor_parallel_size = tensor_parallel_size
         self.gpu_memory_utilization = gpu_memory_utilization
         self.max_model_len = max_model_len
-        self.enable_sleep_mode = enable_sleep_mode
+        self.max_num_batched_tokens = max_num_batched_tokens
+        self.enable_sleep_mode = (enable_sleep_mode if backend == 'vllm'
+                                  and torch.cuda.is_available() else False)
 
         # Track which model is currently active (for VLLM sleep/wake)
         self._active_model: Optional[str] = None
@@ -219,6 +228,7 @@ class LLMClient:
             tensor_parallel_size=self.tensor_parallel_size,
             gpu_memory_utilization=self.gpu_memory_utilization,
             max_model_len=self.max_model_len,
+            max_num_batched_tokens=self.max_num_batched_tokens,
             enable_sleep_mode=self.enable_sleep_mode,
         )
 
@@ -231,6 +241,7 @@ class LLMClient:
                 tensor_parallel_size=self.tensor_parallel_size,
                 gpu_memory_utilization=self.gpu_memory_utilization,
                 max_model_len=self.max_model_len,
+                max_num_batched_tokens=self.max_num_batched_tokens,
                 enable_sleep_mode=self.enable_sleep_mode,
             )
 
@@ -240,11 +251,14 @@ class LLMClient:
         elif self.embedding_model_name == self.evaluation_model_name:
             self.embedding_client = self.evaluation_client
         else:
+            # Don't pass max_model_len/max_num_batched_tokens for embedding
+            # models - let vLLM use the model's native context length
             self.embedding_client = self._create_vllm_client(
                 self.embedding_model_name,
                 tensor_parallel_size=self.tensor_parallel_size,
                 gpu_memory_utilization=self.gpu_memory_utilization,
-                max_model_len=self.max_model_len,
+                max_model_len=None,
+                max_num_batched_tokens=None,
                 enable_sleep_mode=self.enable_sleep_mode,
                 task='embed',
             )
@@ -265,6 +279,7 @@ class LLMClient:
                 tensor_parallel_size=self.tensor_parallel_size,
                 gpu_memory_utilization=self.gpu_memory_utilization,
                 max_model_len=self.max_model_len,
+                max_num_batched_tokens=self.max_num_batched_tokens,
                 enable_sleep_mode=self.enable_sleep_mode,
             )
 
@@ -278,9 +293,10 @@ class LLMClient:
         tensor_parallel_size: int = 1,
         gpu_memory_utilization: float = 0.9,
         max_model_len: Optional[int] = None,
+        max_num_batched_tokens: Optional[int] = None,
         enable_sleep_mode: bool = True,
         task: str = 'generate',
-    ) -> "LLM":  # noqa: F821
+    ) -> 'LLM':  # noqa: F821
         """Create local vLLM client with OpenAI-compatible API.
 
         Args:
@@ -288,6 +304,7 @@ class LLMClient:
             tensor_parallel_size: Number of GPUs for tensor parallelism
             gpu_memory_utilization: GPU memory utilization (0-1)
             max_model_len: Maximum context length
+            max_num_batched_tokens: Maximum number of batched tokens
             enable_sleep_mode: Whether to enable sleep mode
             task: Task type ('generate' or 'embed')
 
@@ -310,10 +327,13 @@ class LLMClient:
         }
         if max_model_len is not None:
             llm_kwargs['max_model_len'] = max_model_len
+        if max_num_batched_tokens is not None:
+            llm_kwargs['max_num_batched_tokens'] = max_num_batched_tokens
         if task == 'embed':
             llm_kwargs['task'] = 'embed'
 
-        vllm_model = LLM(**llm_kwargs)
+        vllm_model = LLM(**llm_kwargs, enforce_eager=True,
+                         trust_remote_code=True)
         logger.info('Local vLLM initialized successfully: %s', model)
         return vllm_model
 
@@ -340,7 +360,7 @@ class LLMClient:
         ]:
             if id(client) not in seen:
                 seen.add(id(client))
-                client.sleep()
+                client.sleep(level=1)
         self._active_model = None
 
     def _activate_model(self, model_type: str) -> None:
@@ -368,7 +388,7 @@ class LLMClient:
         if self._active_model is not None:
             old_client = client_map[self._active_model]
             if id(old_client) != id(new_client):
-                old_client.sleep()
+                old_client.sleep(level=1)
 
         # Wake up new model
         new_client.wake_up()
@@ -556,6 +576,7 @@ class QAGenerationState(TypedDict):
     text_artifacts: List[Any]
     qa_data_to_write: List[Dict[str, Any]]
     model_progression: List[str]
+    backend: str  # Backend to use (nim or vllm)
 
 
 class ArtifactExtractor:
@@ -2754,8 +2775,8 @@ async def generate_qa_pairs(state: QAGenerationState) -> Dict[str, Any]:
                             client=client,
                             summary=summary,
                             query_type_distribution=query_type_distribution,
-                            reasoning_type_distribution=  # noqa: E251
-                            reasoning_type_distribution,  # noqa: E251
+                            reasoning_type_distribution=(
+                                reasoning_type_distribution),
                             min_complexity=min_complexity,
                             min_hops=min_hops,
                             max_hops=max_hops,
@@ -2774,8 +2795,8 @@ async def generate_qa_pairs(state: QAGenerationState) -> Dict[str, Any]:
                             num_pairs=pps,
                             client=client,
                             summary=summary,
-                            reasoning_type_distribution=  # noqa: E251
-                            reasoning_type_distribution,  # noqa: E251
+                            reasoning_type_distribution=(
+                                reasoning_type_distribution),
                             artifacts_context=top_artifacts,
                             self_contained_question=state.get(
                                 'self_contained_question', False),
@@ -2923,10 +2944,12 @@ def validate_answer_spans_hybrid(
                 # anchor here
                 st = seg['start']
                 en = seg['end']
-                qa['start_time'] = (f'{int(st // 3600):02d}:\
-                        {int((st % 3600) // 60):02d}:{int(st % 60):02d}')
-                qa['end_time'] = (f'{int(en // 3600):02d}:\
-                        {int((en % 3600) // 60):02d}:{int(en % 60):02d}')
+                qa['start_time'] = f'{int(st // 3600):02d}:\
+                        {int((st % 3600) // 60):02d}:{int(st % 60):02d}'
+
+                qa['end_time'] = f'{int(en // 3600):02d}:\
+                        {int((en % 3600) // 60):02d}:{int(en % 60):02d}'
+
                 found_anchor = True
                 break
 
@@ -2934,10 +2957,11 @@ def validate_answer_spans_hybrid(
             # fallback: use FAISS‑nearest segment
             st = hit_meta['start']
             en = hit_meta['end']
-            qa['start_time'] = (f'{int(st // 3600):02d}:\
-                    {int((st % 3600) // 60):02d}:{int(st % 60):02d}')
-            qa['end_time'] = (f'{int(en // 3600):02d}:\
-                    {int((en % 3600) // 60):02d}:{int(en % 60):02d}')
+            qa['start_time'] = f'{int(st // 3600):02d}:\
+                    {int((st % 3600) // 60):02d}:{int(st % 60):02d}'
+
+            qa['end_time'] = f'{int(en // 3600):02d}:\
+                    {int((en % 3600) // 60):02d}:{int(en % 60):02d}'
 
         valid.append(qa)
 

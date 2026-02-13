@@ -5,8 +5,18 @@
 input_dir: "/Users/askliar/src/gnn/techqa/corpus"
 output_dir: "/Users/askliar/src/gnn/qa_test"
 
+# Optional: HuggingFace Dataset Download Configuration
+# Uncomment to enable automatic dataset download if input_dir doesn't exist
+# huggingface_repo_id: "nvidia/TechQA-RAG-Eval"
+# huggingface_repo_type: "dataset"
+# huggingface_files:
+#   corpus: "corpus.zip"
+
 # for modality = video, run process_keyframe_workflow to create enhanced transcription data
 modality: "text"
+
+# Backend Configuration (nim or vllm)
+backend: "nim"
 
 # Model Configuration
 gen_model: "nvdev/nvidia/llama-3.1-nemotron-ultra-253b-v1"
@@ -24,7 +34,7 @@ model_progression:
   - "nvdev/nvidia/llama-3.1-nemotron-ultra-253b-v1"
 
 # Embedding model for validation and deduplication
-embed_model: "nvdev/nvidia/llama-3.2-nv-embedqa-1b-v2"
+embedding_model: "nvdev/nvidia/llama-3.2-nv-embedqa-1b-v2"
 
 # Evaluation Configuration
 evaluation:

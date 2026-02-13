@@ -58,15 +58,18 @@ class QAGenerator:
         vllm_tensor_parallel_size: int = 1,
         vllm_gpu_memory_utilization: float = 0.9,
         vllm_max_model_len: Optional[int] = None,
+        vllm_max_num_batched_tokens: Optional[int] = None,
         model_progression: List[str] = None,
     ):
         self.config = self._load_config(config_path)
+        self._validate_data_source_config()
         self.workflow = self._build_qa_generation_workflow()
         self.active_tasks = {}
         self.overwrite = overwrite
         self.batch = batch
         self.batch_size = batch_size
-        self.backend = backend
+        self.backend = (backend if not self.config.get('backend', None) else
+                        self.config.get('backend'))
         self.gen_model = (gen_model if not self.config.get('gen_model', None)
                           else self.config.get('gen_model'))
         self.embedding_model = (embedding_model
@@ -89,6 +92,15 @@ class QAGenerator:
         self.model_progression = model_progression
         self.base_url = base_url
 
+        # Read vLLM config from file if not provided as argument
+        vllm_max_model_len = (vllm_max_model_len if vllm_max_model_len
+                              is not None else self.config.get(
+                                  'vllm_max_model_len', None))
+        vllm_max_num_batched_tokens = (
+            vllm_max_num_batched_tokens
+            if vllm_max_num_batched_tokens is not None else self.config.get(
+                'vllm_max_num_batched_tokens', None))
+
         # Initialize client based on backend
         self.client = LLMClient(
             generation_model=self.gen_model,
@@ -99,6 +111,7 @@ class QAGenerator:
             tensor_parallel_size=vllm_tensor_parallel_size,
             gpu_memory_utilization=vllm_gpu_memory_utilization,
             max_model_len=vllm_max_model_len,
+            max_num_batched_tokens=vllm_max_num_batched_tokens,
             enable_sleep_mode=True,
         )
 
@@ -175,6 +188,109 @@ class QAGenerator:
         with open(config_path) as f:
             return yaml.safe_load(f)
 
+    def _validate_data_source_config(self):
+        """Validate that at least one data source is configured."""
+        input_dir = self.config.get('input_dir', None)
+        huggingface_repo_id = self.config.get('huggingface_repo_id', None)
+
+        assert input_dir or huggingface_repo_id, (
+            "Configuration must specify at least one data source: "
+            "either 'input_dir' (local path) or 'huggingface_repo_id' "
+            "(HuggingFace repository)")
+
+    def _maybe_download_dataset(self) -> Optional[Path]:
+        """Check if dataset needs to be downloaded and prompt user.
+
+        Returns:
+            Path to input directory if it exists or was downloaded
+            successfully, None otherwise.
+        """
+        input_dir = self.config.get('input_dir', None)
+
+        # If input_dir exists, use it (skip download)
+        if input_dir:
+            folder = Path(input_dir)
+            if folder.exists():
+                logger.info('Using existing input directory: %s', input_dir)
+                return folder
+
+        # If no HuggingFace config, can't download
+        huggingface_repo_id = self.config.get('huggingface_repo_id', None)
+        if not huggingface_repo_id:
+            return None
+
+        # Prompt user for download
+        print(f"Input directory not found: {input_dir}")
+        print("Would you like to download the dataset from HuggingFace?")
+        print(f"Repository: {huggingface_repo_id}")
+        user_input = input("Y/N: ")
+
+        if user_input.lower() in ["y", "yes"]:
+            print("Downloading data...")
+            downloaded_path = self._download_from_huggingface()
+            return downloaded_path
+        elif user_input.lower() in ["n", "no"]:
+            logger.error("Download declined by user")
+            return None
+        else:
+            logger.error("Invalid user input")
+            return None
+
+    def _download_from_huggingface(self) -> Optional[Path]:
+        """Download dataset from HuggingFace.
+
+        Returns:
+            Path to downloaded directory if successful, None otherwise.
+        """
+        try:
+            import shutil
+            import zipfile
+
+            from huggingface_hub import hf_hub_download
+
+            repo_id = self.config.get('huggingface_repo_id')
+            repo_type = self.config.get('huggingface_repo_type', 'dataset')
+            files_config = self.config.get('huggingface_files', {})
+            input_dir = self.config.get('input_dir')
+
+            if not input_dir:
+                logger.error(
+                    'input_dir must be specified in config for download '
+                    'destination')
+                return None
+
+            # Create destination directory
+            dest_path = Path(input_dir)
+            if not dest_path.exists():
+                dest_path.mkdir(parents=True, exist_ok=True)
+
+            # Download files based on config
+            for file_key, filename in files_config.items():
+                logger.info(f'Downloading {file_key}: {filename}')
+                downloaded_file = hf_hub_download(
+                    repo_id=repo_id,
+                    repo_type=repo_type,
+                    filename=filename,
+                )
+
+                # Handle zip files
+                if filename.endswith('.zip'):
+                    logger.info(f'Extracting {filename} to {dest_path}')
+                    with zipfile.ZipFile(downloaded_file, 'r') as zip_ref:
+                        zip_ref.extractall(dest_path)
+                else:
+                    # Copy non-zip files
+                    dest_file = dest_path / filename
+                    shutil.copy(downloaded_file, dest_file)
+                    logger.info(f'Copied {filename} to {dest_file}')
+
+            logger.info(f'Successfully downloaded dataset to {dest_path}')
+            return dest_path
+
+        except Exception as e:
+            logger.error(f'Failed to download dataset from HuggingFace: {e}')
+            return None
+
     def check_already_done(self):
         if self.overwrite:
             return []
@@ -195,13 +311,12 @@ class QAGenerator:
         return done_file_paths
 
     async def process_directory(self):
-        input_dir = self.config.get('input_dir', None)
-        folder = None
-        if input_dir:
-            folder = Path(input_dir)
-            if not folder.exists():
-                logger.error('Folder not found: %s', input_dir)
-                return
+        # Try to download dataset if input_dir doesn't exist
+        folder = self._maybe_download_dataset()
+
+        if folder is None or not folder.exists():
+            logger.error('Cannot proceed: no input directory available')
+            return
 
         done_file_paths = self.check_already_done()
         output_dir = self.config.get('output_dir')
